@@ -134,8 +134,9 @@ size_t dbnHeaderSize(const uint8_t* src, size_t size)
 // the successor graph accepts any number of inputs.
 constexpr int kSplitByInstrumentPid = 1;
 constexpr int kMultiInputPid        = 2;
-// Instruments beyond this many share one set of streams in a frame.
-constexpr size_t kMaxInstruments = 64;
+// Keeps a frame under the runtime node limit. Instruments beyond this many
+// share one set of streams.
+constexpr size_t kMaxInstruments = 32;
 
 // Dispatch instructions that merge consecutive segments with the same tag.
 struct Segments {
@@ -473,11 +474,12 @@ bool compressFile(
 {
     Bytes buf, frame;
     bool eof = false, first = true;
+    size_t extra = 0;
     inSize  = 0;
     outSize = 0;
     while (!eof || !buf.empty() || first) {
         const size_t want =
-                opt.frameRecords * kRecordSize + (first ? 1 << 20 : 0);
+                opt.frameRecords * kRecordSize + (first ? 1 << 20 : 0) + extra;
         if (!eof && buf.size() < want) {
             const size_t have = buf.size();
             buf.resize(want);
@@ -491,8 +493,11 @@ bool compressFile(
         const auto* src = reinterpret_cast<const uint8_t*>(buf.data());
         const size_t end =
                 frameEnd(src, buf.size(), 0, first, opt.frameRecords, eof);
-        if (end == 0 && !eof)
+        if (end == 0 && !eof) {
+            extra += want;
             continue;
+        }
+        extra = 0;
         frame.clear();
         if (!compressFrame(opt, buf.data(), end, frame)
             || std::fwrite(frame.data(), 1, frame.size(), out) != frame.size())
@@ -568,7 +573,7 @@ void put(Bytes& b, size_t off, uint64_t v, size_t width)
 
 // A DBN-shaped file: metadata block, then MBP-10 records from a few
 // interleaved instruments, each with its own random-walk order book.
-Bytes synthetic(size_t nbRecords, uint64_t seed)
+Bytes synthetic(size_t nbRecords, uint64_t seed, size_t nbInstruments = 6)
 {
     struct Book {
         uint32_t id;
@@ -578,7 +583,7 @@ Bytes synthetic(size_t nbRecords, uint64_t seed)
     constexpr int64_t kTick = 250000000; // 0.25 in 1e-9 units
     Rng rng{ seed | 1 };
     std::vector<Book> books;
-    for (uint32_t i = 0; i < 6; ++i) {
+    for (uint32_t i = 0; i < nbInstruments; ++i) {
         Book b{};
         b.id  = 1000 + 37 * i;
         b.mid = (6000 + 100 * i) * 4 * kTick;
@@ -598,7 +603,9 @@ Bytes synthetic(size_t nbRecords, uint64_t seed)
     uint64_t ts = 1762300800000000000ull;
     for (size_t r = 0; r < nbRecords; ++r) {
         // Front instruments trade far more often than back ones.
-        Book& b          = books[rng.below(3) ? rng.below(2) : rng.below(6)];
+        Book& b = r < books.size()
+                ? books[r]
+                : books[rng.below(3) ? rng.below(2) : rng.below(books.size())];
         const int side   = static_cast<int>(rng.below(2));
         const size_t lvl = rng.below(4) ? rng.below(3) : rng.below(kLevels);
         char action      = 'A';
@@ -682,8 +689,11 @@ int selfTest()
     bool ok = true;
     Options opt;
     const Bytes data = synthetic(20000, 42);
+    const Bytes manyInstruments = synthetic(1000, 43, 100);
     size_t split = 0, merged = 0;
     ok &= roundTrips("synthetic, per instrument", opt, data, &split);
+    ok &= roundTrips(
+            "synthetic, 100 instruments", opt, manyInstruments, nullptr);
     Options noSplit           = opt;
     noSplit.splitByInstrument = false;
     ok &= roundTrips("synthetic, no instrument split", noSplit, data, &merged);
@@ -725,6 +735,45 @@ int selfTest()
                 stderr,
                 "file streaming matches in-memory     %s\n",
                 ok ? "ok" : "FAILED");
+    }
+
+    // A non-DBN stream whose first byte is zero needs more input before EOF.
+    // This exercises the reader's no-frame-boundary growth path.
+    {
+        Options edge = opt;
+        edge.frameRecords = 1;
+        Bytes edgeData((1u << 20) + 4096, '\x01');
+        edgeData[0] = '\0';
+        FILE* in  = std::tmpfile();
+        FILE* out = std::tmpfile();
+        Bytes encoded, restored;
+        size_t inSize = 0, outSize = 0;
+        bool edgeOk = in && out
+                && std::fwrite(edgeData.data(), 1, edgeData.size(), in)
+                        == edgeData.size()
+                && std::fseek(in, 0, SEEK_SET) == 0
+                && compressFile(edge, in, out, inSize, outSize)
+                && std::fseek(out, 0, SEEK_END) == 0;
+        if (edgeOk) {
+            const long encodedSize = std::ftell(out);
+            edgeOk = encodedSize >= 0 && std::fseek(out, 0, SEEK_SET) == 0;
+            if (edgeOk) {
+                encoded.resize(static_cast<size_t>(encodedSize));
+                edgeOk = std::fread(encoded.data(), 1, encoded.size(), out)
+                        == encoded.size();
+            }
+        }
+        edgeOk = edgeOk && decompress(encoded, restored) && restored == edgeData
+                && inSize == edgeData.size() && outSize == encoded.size();
+        if (in)
+            std::fclose(in);
+        if (out)
+            std::fclose(out);
+        ok &= edgeOk;
+        std::fprintf(
+                stderr,
+                "streamed zero-length prefix grows buffer  %s\n",
+                edgeOk ? "ok" : "FAILED");
     }
 
     // Inputs the parser must carry through unchanged.
